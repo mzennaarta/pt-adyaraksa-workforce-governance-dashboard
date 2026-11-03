@@ -1,4 +1,6 @@
--- CEK DUPLIKAT
+-- ==========================================
+-- 1. CEK DUPLIKAT
+-- ==========================================
 
 -- Cek duplikat tabel departments
 SELECT dept_id, COUNT(*) 
@@ -31,8 +33,9 @@ GROUP BY record_id
 HAVING COUNT(*) > 1;
 
 
--- DATA QUALITY CHECK --
--- Deskripsi: Mengecek jumlah baris kosong (NULL)
+-- ==========================================
+-- 2. DATA QUALITY CHECK (NULL VALUES)
+-- ==========================================
 
 -- Cek null tabel departments
 SELECT 
@@ -62,7 +65,7 @@ SELECT
     COUNT(*) - COUNT(manager_id) AS null_manager_id
 FROM employees;
 
---cek null tabel attedance
+-- Cek null tabel attendance
 SELECT 
     COUNT(*) AS total_baris,
     COUNT(*) - COUNT(record_id) AS null_record_id,
@@ -74,7 +77,7 @@ SELECT
     COUNT(*) - COUNT(status) AS null_status
 FROM attendance;
 
---cek null tabel performance
+-- Cek null tabel performance
 SELECT 
     COUNT(*) AS total_baris,
     COUNT(*) - COUNT(review_id) AS null_review_id,
@@ -88,8 +91,7 @@ SELECT
     COUNT(*) - COUNT(notes) AS null_notes
 FROM performance;
 
-
-----cek null tabel salary_history
+-- Cek null tabel salary_history
 SELECT 
     COUNT(*) AS total_baris,
     COUNT(*) - COUNT(record_id) AS null_record_id,
@@ -101,7 +103,7 @@ SELECT
     COUNT(*) - COUNT(change_reason) AS null_change_reason
 FROM salary_history;
 
-
+-- Audit Format Tanggal Campur pada salary_history
 SELECT 
     COUNT(*) AS total_baris,
     COUNT(CASE WHEN effective_date::TEXT ~ '^\d{4}-\d{2}-\d{2}$' THEN 1 END) AS format_yyyy_mm_dd,
@@ -109,56 +111,41 @@ SELECT
     COUNT(CASE WHEN effective_date::TEXT ~ '^\d{2}/\d{2}/\d{4}$' THEN 1 END) AS format_dd_slash_mm_yyyy
 FROM salary_history;
 
--- Cleansing
+
+-- ==========================================
+-- 3. DATA CLEANSING & PARSING BERTINGKAT
+-- ==========================================
 
 -- String Formatting employees
 SELECT 
     emp_id,
-    -- Menghapus spasi di awal/akhir nama
     btrim(full_name) AS full_name_clean,
-    -- Menghapus spasi dan mengubah email menjadi huruf kecil semua
     lower(btrim(email)) AS email_clean,
-    -- Merapikan jabatan
     btrim("position") AS position_clean
 FROM employees;
 
--- General Deduplication
-WITH ranked_data AS (
+-- Parse Bertingkat Tanggal & Deduplikasi pada salary_history
+WITH parsed_date_salary AS (
     SELECT 
-        *,
-        row_number() OVER (
-            PARTITION BY emp_id, effective_date, base_salary_idr, allowances_idr, total_idr, change_reason 
-            ORDER BY record_id
-        ) AS rn
+        record_id,
+        emp_id,
+        -- Parse bertingkat: menyeragamkan 3 format tanggal menjadi standar ISO (YYYY-MM-DD)
+        CASE 
+            WHEN effective_date::TEXT ~ '^\d{4}-\d{2}-\d{2}$' 
+                THEN effective_date::DATE
+            WHEN effective_date::TEXT ~ '^\d{2}-\d{2}-\d{4}$' 
+                THEN TO_DATE(effective_date::TEXT, 'DD-MM-YYYY')
+            WHEN effective_date::TEXT ~ '^\d{2}/\d{2}/\d{4}$' 
+                THEN TO_DATE(effective_date::TEXT, 'DD/MM/YYYY')
+            ELSE NULL 
+        END AS effective_date,
+        base_salary_idr,
+        allowances_idr,
+        total_idr,
+        change_reason
     FROM salary_history
-)
-SELECT * 
-FROM ranked_data 
-WHERE rn = 1; -- Hanya ambil baris pertama yang unik, buang duplikatnya
-
-
--- cek duplikat salary_history
-SELECT 
-    emp_id, 
-    effective_date, 
-    base_salary_idr, 
-    allowances_idr, 
-    total_idr, 
-    change_reason,
-    COUNT(*) AS total_kemunculan
-FROM salary_history
-GROUP BY 
-    emp_id, 
-    effective_date, 
-    base_salary_idr, 
-    allowances_idr, 
-    total_idr, 
-    change_reason
-HAVING COUNT(*) > 1; -- Menyaring hanya kombinasi data yang muncul lebih dari 1 kali
-
-
--- Deduplication
-WITH ranked_salary AS (
+),
+ranked_salary AS (
     SELECT 
         record_id,
         emp_id,
@@ -177,7 +164,7 @@ WITH ranked_salary AS (
                 change_reason 
             ORDER BY record_id ASC
         ) AS rn
-    FROM salary_history
+    FROM parsed_date_salary
 )
 SELECT 
     record_id,
@@ -191,7 +178,9 @@ FROM ranked_salary
 WHERE rn = 1; -- Filter only the first unique record (Post-Cleaning Dataset)
 
 
--- Analysis
+-- ==========================================
+-- 4. ANALISIS & METRIK BISNIS
+-- ==========================================
 
 -- Sebaran Status & Sinyal Awal Turnover
 SELECT 
@@ -213,19 +202,31 @@ LEFT JOIN employees e ON d.dept_id = e.dept_id AND e.status = 'active'
 GROUP BY d.dept_name, d.location
 ORDER BY total_headcount DESC;
 
--- Audit Kualitas Data & Tren Payroll
-WITH calculated_salary AS (
+-- Audit Kualitas Data & Tren Payroll (Menggunakan tanggal bersih yang telah di-parse)
+WITH parsed_date_salary AS (
     SELECT 
+        emp_id,
+        record_id,
         change_reason,
         base_salary_idr::bigint AS base_salary_idr,
-        -- Menghitung gaji periode sebelumnya per karyawan
-        LAG(base_salary_idr::bigint) OVER (PARTITION BY emp_id ORDER BY effective_date, record_id) AS prev_base,
-        -- Menandai jika ada penurunan gaji secara on-the-fly
         CASE 
-            WHEN base_salary_idr::bigint < LAG(base_salary_idr::bigint) OVER (PARTITION BY emp_id ORDER BY effective_date, record_id) THEN 1 
+            WHEN effective_date::TEXT ~ '^\d{4}-\d{2}-\d{2}$' THEN effective_date::DATE
+            WHEN effective_date::TEXT ~ '^\d{2}-\d{2}-\d{4}$' THEN TO_DATE(effective_date::TEXT, 'DD-MM-YYYY')
+            WHEN effective_date::TEXT ~ '^\d{2}/\d{2}/\d{4}$' THEN TO_DATE(effective_date::TEXT, 'DD/MM/YYYY')
+            ELSE NULL 
+        END AS effective_date
+    FROM salary_history
+),
+calculated_salary AS (
+    SELECT 
+        change_reason,
+        base_salary_idr,
+        LAG(base_salary_idr) OVER (PARTITION BY emp_id ORDER BY effective_date, record_id) AS prev_base,
+        CASE 
+            WHEN base_salary_idr < LAG(base_salary_idr) OVER (PARTITION BY emp_id ORDER BY effective_date, record_id) THEN 1 
             ELSE 0 
         END AS is_decrease
-    FROM salary_history
+    FROM parsed_date_salary
 )
 SELECT 
     change_reason,
@@ -262,12 +263,10 @@ SELECT
     e.dept_id,
     COUNT(a.record_id) AS total_presensi,
     ROUND(AVG(NULLIF(btrim(a.work_hours::text), '')::numeric), 2) AS avg_work_hours,
-    -- Menghitung kasus lupa check-out
     COUNT(*) FILTER (
         WHERE NULLIF(btrim(a.check_in::text), '') IS NOT NULL 
           AND NULLIF(btrim(a.check_out::text), '') IS NULL
     ) AS jumlah_missing_checkout,
-    -- Menghitung kasus jam kerja > 12 jam
     COUNT(*) FILTER (
         WHERE NULLIF(btrim(a.work_hours::text), '')::numeric > 12
     ) AS jumlah_jam_ekstrem
@@ -278,12 +277,25 @@ GROUP BY e.dept_id
 ORDER BY total_presensi DESC;
 
 -- Pay Equity & Salary Band per Jabatan/Level
-WITH latest_salary AS (
+WITH parsed_date_salary AS (
     SELECT 
         emp_id,
+        record_id,
         base_salary_idr::bigint AS base_salary,
-        ROW_NUMBER() OVER (PARTITION BY emp_id ORDER BY effective_date DESC, record_id DESC) AS rn
+        CASE 
+            WHEN effective_date::TEXT ~ '^\d{4}-\d{2}-\d{2}$' THEN effective_date::DATE
+            WHEN effective_date::TEXT ~ '^\d{2}-\d{2}-\d{4}$' THEN TO_DATE(effective_date::TEXT, 'DD-MM-YYYY')
+            WHEN effective_date::TEXT ~ '^\d{2}/\d{2}/\d{4}$' THEN TO_DATE(effective_date::TEXT, 'DD/MM/YYYY')
+            ELSE NULL 
+        END AS effective_date
     FROM salary_history
+),
+latest_salary AS (
+    SELECT 
+        emp_id,
+        base_salary,
+        ROW_NUMBER() OVER (PARTITION BY emp_id ORDER BY effective_date DESC, record_id DESC) AS rn
+    FROM parsed_date_salary
 )
 SELECT 
     e.position,
@@ -291,7 +303,6 @@ SELECT
     MIN(s.base_salary) AS min_salary,
     ROUND(AVG(s.base_salary), 0) AS avg_salary,
     MAX(s.base_salary) AS max_salary,
-    -- Menghitung selisih/gap antara gaji tertinggi dan terendah pada jabatan yang sama
     MAX(s.base_salary) - MIN(s.base_salary) AS salary_gap
 FROM employees e
 JOIN latest_salary s ON e.emp_id = s.emp_id AND s.rn = 1
@@ -299,19 +310,84 @@ WHERE e.status = 'active'
 GROUP BY e.position
 ORDER BY avg_salary DESC;
 
+-- Cek Jumlah Anomali Payroll Berdasarkan Kategori
+WITH parsed_date_salary AS (
+    SELECT 
+        emp_id,
+        record_id,
+        change_reason,
+        base_salary_idr::bigint AS base_salary_idr,
+        CASE 
+            WHEN effective_date::TEXT ~ '^\d{4}-\d{2}-\d{2}$' THEN effective_date::DATE
+            WHEN effective_date::TEXT ~ '^\d{2}-\d{2}-\d{4}$' THEN TO_DATE(effective_date::TEXT, 'DD-MM-YYYY')
+            WHEN effective_date::TEXT ~ '^\d{2}/\d{2}/\d{4}$' THEN TO_DATE(effective_date::TEXT, 'DD/MM/YYYY')
+            ELSE NULL 
+        END AS effective_date
+    FROM salary_history
+),
+salary_with_lag AS (
+    SELECT 
+        emp_id,
+        record_id,
+        change_reason,
+        base_salary_idr,
+        effective_date,
+        LAG(base_salary_idr) OVER (PARTITION BY emp_id ORDER BY effective_date, record_id) AS prev_base_salary
+    FROM parsed_date_salary
+),
+flagged_anomalies AS (
+    SELECT 
+        emp_id,
+        record_id,
+        change_reason,
+        base_salary_idr,
+        prev_base_salary,
+        CASE 
+            WHEN base_salary_idr <= 0 THEN 'Gaji Nol atau Negatif'
+            WHEN base_salary_idr < prev_base_salary THEN 'Penurunan Gaji (Salary Decrease)'
+            WHEN base_salary_idr > (prev_base_salary * 2.0) THEN 'Lonjakan Gaji Ekstrem (>100%)'
+            ELSE 'Normal'
+        END AS anomaly_type
+    FROM salary_with_lag
+)
+SELECT 
+    anomaly_type,
+    COUNT(*) AS total_anomali_count
+FROM flagged_anomalies
+WHERE anomaly_type != 'Normal'
+GROUP BY anomaly_type
+ORDER BY total_anomali_count DESC;
+
+-- Cek Total Baris Sebelum Cleaning
 SELECT COUNT(*) AS total_rows_pre_cleaning
 FROM salary_history;
 
-WITH ranked_data AS (
+-- Cek Total Baris Duplikat
+WITH parsed_date_salary AS (
+    SELECT 
+        emp_id,
+        record_id,
+        base_salary_idr,
+        allowances_idr,
+        total_idr,
+        change_reason,
+        CASE 
+            WHEN effective_date::TEXT ~ '^\d{4}-\d{2}-\d{2}$' THEN effective_date::DATE
+            WHEN effective_date::TEXT ~ '^\d{2}-\d{2}-\d{4}$' THEN TO_DATE(effective_date::TEXT, 'DD-MM-YYYY')
+            WHEN effective_date::TEXT ~ '^\d{2}/\d{2}/\d{4}$' THEN TO_DATE(effective_date::TEXT, 'DD/MM/YYYY')
+            ELSE NULL 
+        END AS effective_date
+    FROM salary_history
+),
+ranked_data AS (
     SELECT 
         *,
         ROW_NUMBER() OVER (
             PARTITION BY emp_id, effective_date, base_salary_idr, allowances_idr, total_idr, change_reason 
             ORDER BY record_id
         ) AS rn
-    FROM salary_history
+    FROM parsed_date_salary
 )
 SELECT COUNT(*) AS total_duplicate_rows
 FROM ranked_data 
 WHERE rn > 1; -- Mengambil hanya baris duplikat
-
